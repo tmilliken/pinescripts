@@ -1,0 +1,228 @@
+//@version=6
+indicator("NY & Asian Session Opening Range (Enhanced)", overlay=true, max_lines_count=40)
+
+// ─────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────
+ny_timezone = "America/New_York"
+
+asian_timezone = input.string("Etc/UTC", "Asian Session Timezone")
+
+show_asian_range = input.bool(true, "Show Asian Session Range")
+
+// NY 15min visuals
+high_line_color = input.color(color.new(color.green, 50), "NY 15min Range High Line Color")
+low_line_color  = input.color(color.new(color.red, 50),   "NY 15min Range Low Line Color")
+box_color       = input.color(color.new(color.blue, 90),  "NY 15min Range Box Color")
+
+// NY 30min visuals
+high_line_color_30 = input.color(color.new(color.green, 20), "NY 30min Range High Line Color")
+low_line_color_30  = input.color(color.new(color.red, 20),   "NY 30min Range Low Line Color")
+box_color_30       = input.color(color.new(color.blue, 80),  "NY 30min Range Box Color")
+
+// Asian visuals
+asian_high_color = input.color(color.new(color.orange, 50), "Asian Range High Line Color")
+asian_low_color  = input.color(color.new(color.purple, 50), "Asian Range Low Line Color")
+asian_box_color  = input.color(color.new(color.yellow, 85), "Asian Range Box Color")
+
+line_width = input.int(2, "Line Width", minval=1, maxval=5)
+
+// ─────────────────────────────────────────────
+// NY SESSION LOGIC
+// ─────────────────────────────────────────────
+is_ny_open() => hour(time, ny_timezone) == 9 and minute(time, ny_timezone) == 30
+
+is_first_15_min() =>
+    session_time = time(timeframe.period, "0930-0945", ny_timezone)
+    not na(session_time)
+
+is_first_30_min() =>
+    session_time = time(timeframe.period, "0930-1000", ny_timezone)
+    not na(session_time)
+
+is_draw_window() =>
+    session_time = time(timeframe.period, "0930-1200", ny_timezone)
+    not na(session_time)
+
+// ─────────────────────────────────────────────
+// ASIAN SESSION LOGIC (5-min range)
+// ─────────────────────────────────────────────
+is_asian_open() => hour(time, asian_timezone) == 0 and minute(time, asian_timezone) == 0
+
+is_asian_first_5_min() =>
+    session_time = time(timeframe.period, "0000-0005", asian_timezone)
+    not na(session_time)
+
+is_asian_first_hour() =>
+    session_time = time(timeframe.period, "0000-0100", asian_timezone)
+    not na(session_time)
+
+// ─────────────────────────────────────────────
+// NY 15MIN ORB VARIABLES
+// ─────────────────────────────────────────────
+var float range_high = na
+var float range_low  = na
+var float range_size = na
+var int   session_start_bar = na
+var line  high_line = na
+var line  low_line  = na
+var box   range_box = na
+var bool  range_set = false
+
+// ─────────────────────────────────────────────
+// NY 30MIN ORB VARIABLES
+// ─────────────────────────────────────────────
+var float range_high_30 = na
+var float range_low_30  = na
+var line  high_line_30  = na
+var line  low_line_30   = na
+var box   range_box_30  = na
+var bool  range_set_30  = false
+
+// Reset both ranges at NY open
+if is_ny_open()
+    // 15min reset
+    range_high := high
+    range_low  := low
+    range_size := high - low
+    session_start_bar := bar_index
+    range_set := false
+    if not na(high_line)
+        line.delete(high_line)
+    if not na(low_line)
+        line.delete(low_line)
+    if not na(range_box)
+        box.delete(range_box)
+    high_line := na
+    low_line  := na
+    range_box := na
+
+    // 30min reset
+    range_high_30 := high
+    range_low_30  := low
+    range_set_30  := false
+    if not na(high_line_30)
+        line.delete(high_line_30)
+    if not na(low_line_30)
+        line.delete(low_line_30)
+    if not na(range_box_30)
+        box.delete(range_box_30)
+    high_line_30 := na
+    low_line_30  := na
+    range_box_30 := na
+
+// Update 15min range
+if is_first_15_min() and not na(range_high)
+    range_high := math.max(range_high, high)
+    range_low  := math.min(range_low,  low)
+    range_size := range_high - range_low
+
+// Update 30min range
+if is_first_30_min() and not na(range_high_30)
+    range_high_30 := math.max(range_high_30, high)
+    range_low_30  := math.min(range_low_30,  low)
+
+// Mark 15min range complete
+if not is_first_15_min() and is_first_15_min()[1] and not range_set
+    range_set := true
+
+// Mark 30min range complete
+if not is_first_30_min() and is_first_30_min()[1] and not range_set_30
+    range_set_30 := true
+
+// Draw 15min range (during first hour)
+if is_draw_window() and not na(range_high)
+    if not na(high_line)
+        line.delete(high_line)
+    if not na(low_line)
+        line.delete(low_line)
+    if not na(range_box)
+        box.delete(range_box)
+    high_line := line.new(session_start_bar, range_high, bar_index, range_high, xloc=xloc.bar_index, color=high_line_color, width=line_width)
+    low_line  := line.new(session_start_bar, range_low,  bar_index, range_low,  xloc=xloc.bar_index, color=low_line_color,  width=line_width)
+    range_box := box.new(session_start_bar, range_high, bar_index, range_low,   xloc=xloc.bar_index, bgcolor=box_color, border_color=color.new(color.blue, 100))
+
+// Draw 30min range (during first hour, after 30min is complete)
+if is_draw_window() and range_set_30 and not na(range_high_30)
+    if not na(high_line_30)
+        line.delete(high_line_30)
+    if not na(low_line_30)
+        line.delete(low_line_30)
+    if not na(range_box_30)
+        box.delete(range_box_30)
+    high_line_30 := line.new(session_start_bar, range_high_30, bar_index, range_high_30, xloc=xloc.bar_index, color=high_line_color_30, width=line_width)
+    low_line_30  := line.new(session_start_bar, range_low_30,  bar_index, range_low_30,  xloc=xloc.bar_index, color=low_line_color_30,  width=line_width)
+    range_box_30 := box.new(session_start_bar, range_high_30, bar_index, range_low_30,   xloc=xloc.bar_index, bgcolor=box_color_30, border_color=color.new(color.blue, 100))
+
+// ─────────────────────────────────────────────
+// ASIAN RANGE VARIABLES
+// ─────────────────────────────────────────────
+var float asian_high = na
+var float asian_low  = na
+var float asian_size = na
+var int   asian_start_bar = na
+var line  asian_high_line = na
+var line  asian_low_line  = na
+var box   asian_box = na
+var bool  asian_set = false
+
+// Reset at Asian open
+if is_asian_open()
+    asian_high := high
+    asian_low  := low
+    asian_size := high - low
+    asian_start_bar := bar_index
+    asian_set := false
+    if not na(asian_high_line)
+        line.delete(asian_high_line)
+    if not na(asian_low_line)
+        line.delete(asian_low_line)
+    if not na(asian_box)
+        box.delete(asian_box)
+    asian_high_line := na
+    asian_low_line  := na
+    asian_box       := na
+
+// Update during first 5 minutes
+if is_asian_first_5_min() and not na(asian_high)
+    asian_high := math.max(asian_high, high)
+    asian_low  := math.min(asian_low,  low)
+    asian_size := asian_high - asian_low
+
+// Mark Asian range complete
+if not is_asian_first_5_min() and is_asian_first_5_min()[1] and not asian_set
+    asian_set := true
+
+// Draw Asian range
+if show_asian_range and is_asian_first_hour() and not na(asian_high)
+    if not na(asian_high_line)
+        line.delete(asian_high_line)
+    if not na(asian_low_line)
+        line.delete(asian_low_line)
+    if not na(asian_box)
+        box.delete(asian_box)
+    asian_high_line := line.new(asian_start_bar, asian_high, bar_index, asian_high, xloc=xloc.bar_index, color=asian_high_color, width=line_width)
+    asian_low_line  := line.new(asian_start_bar, asian_low,  bar_index, asian_low,  xloc=xloc.bar_index, color=asian_low_color,  width=line_width)
+    asian_box       := box.new(asian_start_bar, asian_high, bar_index, asian_low,   xloc=xloc.bar_index, bgcolor=asian_box_color, border_color=color.new(color.orange, 100))
+
+// If user turns Asian OFF, remove drawings
+if not show_asian_range
+    if not na(asian_high_line)
+        line.delete(asian_high_line)
+        asian_high_line := na
+    if not na(asian_low_line)
+        line.delete(asian_low_line)
+        asian_low_line := na
+    if not na(asian_box)
+        box.delete(asian_box)
+        asian_box := na
+
+// ─────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────
+alertcondition(is_ny_open(), title="NY Market Open", message="NY market has opened - Range tracking started")
+alertcondition(not is_first_15_min() and is_first_15_min()[1], title="NY 15min Range Complete", message="15-minute NY open range complete")
+alertcondition(not is_first_30_min() and is_first_30_min()[1], title="NY 30min Range Complete", message="30-minute NY open range complete")
+
+alertcondition(is_asian_open(), title="Asian Market Open", message="Asian market has opened - 5-min range tracking started")
+alertcondition(not is_asian_first_5_min() and is_asian_first_5_min()[1], title="Asian Range Complete", message="Asian 5-min range complete")

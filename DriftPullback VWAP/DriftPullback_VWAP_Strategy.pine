@@ -1,0 +1,208 @@
+//@version=5
+strategy("DriftPullback VWAP Strategy", shorttitle="DP-VWAP Strat", overlay=true,
+     initial_capital=25000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0,
+     slippage=0, calc_on_every_tick=false)
+
+// ============================================================================
+// Inputs
+// ============================================================================
+vwapTF          = input.timeframe("15", "VWAP Calculation Timeframe")
+sessionInput    = input.session("0930-1600", "RTH Session (VWAP anchor + trading day)")
+sessionTZ       = input.string("America/New_York", "Session Timezone")
+srcInput        = input.source(hlc3, "VWAP Source")
+
+entryWindow     = input.session("1030-1530", "Entry Window (1hr-after-open through no-new-trades cutoff)")
+flattenWindow   = input.session("1555-1600", "Force-Flatten Window")
+
+momentumLookbackMin  = input.int(60, "Momentum Lookback (minutes)", minval=5)
+momentumThreshold    = input.float(0.1, "Momentum Threshold (%)", minval=0.0, step=0.01)
+vwapSlopeLookbackMin = input.int(15, "VWAP Slope Lookback (minutes)", minval=5)
+
+maxDistFromVWAP = input.float(10, "Max Distance From VWAP At Trigger (points)", minval=0)
+
+qtyContracts    = input.int(1, "Contracts per Trade", minval=1)
+longStopPts     = input.float(80, "Long Stop (points)", minval=0)
+shortStopPts    = input.float(80, "Short Stop (points)", minval=0)
+
+trailActivateR  = input.float(1.0, "Trail Activation (multiple of initial risk)", minval=0)
+trailBufferPts  = input.float(15, "Trail Buffer Beyond VWAP (points)", minval=0)
+trailStage2R    = input.float(2.5, "Stage 2 Trail Activation (multiple of initial risk, widens buffer)", minval=0)
+trailBufferPts2 = input.float(25, "Stage 2 Trail Buffer Beyond VWAP (points)", minval=0)
+
+maxTradesPerDay = input.int(4, "Max Trades Per Day", minval=1)
+maxLossesPerDay = input.int(2, "Max Losses Per Day", minval=1)
+cooldownBars    = input.int(6, "Bars to Wait After a Loss Before Re-Entering", minval=0)
+
+showVwapLine    = input.bool(true, "Show VWAP Line")
+lineColor       = input.color(color.new(color.blue, 0), "VWAP Line Color")
+
+// ============================================================================
+// Session-anchored VWAP: computed natively on the 15min series, reset fresh
+// at the RTH open (9:30 ET) and flat/na outside the session (overnight
+// Globex session ignored entirely). Same approach as the DriftPullback VWAP
+// indicator.
+// ============================================================================
+calcVWAP() =>
+    sess = not na(time(timeframe.period, sessionInput, sessionTZ))
+    newSession = sess and not sess[1]
+
+    var float cumPV  = na
+    var float cumVol = na
+
+    if newSession
+        cumPV  := 0.0
+        cumVol := 0.0
+    else if not sess
+        cumPV  := na
+        cumVol := na
+
+    if sess
+        cumPV  := cumPV + srcInput * volume
+        cumVol := cumVol + volume
+
+    vwapVal = sess ? cumPV / cumVol : na
+    [vwapVal, sess]
+
+[vwapHTF, sessHTF] = request.security(syminfo.tickerid, vwapTF, calcVWAP(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+plot(showVwapLine and sessHTF ? vwapHTF : na, title="DriftPullback VWAP", color=lineColor, linewidth=2, style=plot.style_stepline)
+
+// ============================================================================
+// Bar-count conversions (lookbacks expressed in minutes, converted using the
+// chart's own timeframe so this still works if run on something other than
+// the intended 5min chart)
+// ============================================================================
+minutesPerBar = timeframe.in_seconds() / 60
+bars15 = math.max(1, math.round(vwapSlopeLookbackMin / minutesPerBar))
+barsHr = math.max(1, math.round(momentumLookbackMin / minutesPerBar))
+
+// ============================================================================
+// Signal conditions
+// ============================================================================
+risingVWAP  = not na(vwapHTF) and not na(vwapHTF[bars15]) and vwapHTF > vwapHTF[bars15]
+fallingVWAP = not na(vwapHTF) and not na(vwapHTF[bars15]) and vwapHTF < vwapHTF[bars15]
+
+pctChangeHr  = (close - close[barsHr]) / close[barsHr] * 100.0
+momentumUp   = pctChangeHr >= momentumThreshold
+momentumDown = pctChangeHr <= -momentumThreshold
+
+priceAboveVWAP = not na(vwapHTF) and close > vwapHTF
+priceBelowVWAP = not na(vwapHTF) and close < vwapHTF
+
+inEntryWindow   = not na(time(timeframe.period, entryWindow, sessionTZ))
+inFlattenWindow = not na(time(timeframe.period, flattenWindow, sessionTZ))
+
+// ============================================================================
+// Daily guardrail counters (reset at each new RTH session)
+// ============================================================================
+newRTHSession = sessHTF and not sessHTF[1]
+
+var int tradesToday       = 0
+var int lossesToday       = 0
+var int prevClosedTrades  = 0
+var int lastLossExitBar   = na
+
+if newRTHSession
+    tradesToday := 0
+    lossesToday := 0
+
+if strategy.closedtrades > prevClosedTrades
+    for i = prevClosedTrades to strategy.closedtrades - 1
+        if strategy.closedtrades.profit(i) < 0
+            lossesToday := lossesToday + 1
+            lastLossExitBar := strategy.closedtrades.exit_bar_index(i)
+    prevClosedTrades := strategy.closedtrades
+
+cooldownActive = not na(lastLossExitBar) and (bar_index - lastLossExitBar) < cooldownBars
+guardrailsOk = tradesToday < maxTradesPerDay and lossesToday < maxLossesPerDay and not cooldownActive
+
+// ============================================================================
+// Setup + "first pullback candle toward VWAP" trigger
+// ============================================================================
+isFlat = strategy.position_size == 0
+
+longSetup  = priceAboveVWAP and risingVWAP  and momentumUp   and inEntryWindow and guardrailsOk and isFlat
+shortSetup = priceBelowVWAP and fallingVWAP and momentumDown and inEntryWindow and guardrailsOk and isFlat
+
+var bool longArmed  = false
+var bool shortArmed = false
+
+if longSetup and not longArmed
+    longArmed := true
+if not longSetup
+    longArmed := false
+
+if shortSetup and not shortArmed
+    shortArmed := true
+if not shortSetup
+    shortArmed := false
+
+isRedCandle   = close < open
+isGreenCandle = close > open
+
+withinRangeOfVWAP = not na(vwapHTF) and math.abs(close - vwapHTF) <= maxDistFromVWAP
+
+longTrigger  = longArmed  and longSetup  and isRedCandle   and withinRangeOfVWAP
+shortTrigger = shortArmed and shortSetup and isGreenCandle and withinRangeOfVWAP
+
+if longTrigger
+    strategy.entry("Long", strategy.long, qty=qtyContracts)
+    tradesToday := tradesToday + 1
+    longArmed := false
+
+if shortTrigger
+    strategy.entry("Short", strategy.short, qty=qtyContracts)
+    tradesToday := tradesToday + 1
+    shortArmed := false
+
+// ============================================================================
+// Trailing exit off VWAP (no fixed target - let winners run until VWAP
+// structure actually breaks). Stop starts at a fixed distance from the
+// fill, only starts trailing once the trade is far enough in profit, then
+// only ever ratchets tighter, widening its buffer once the move extends
+// further so a normal pullback doesn't clip an already-large move.
+// ============================================================================
+var float activeStop  = na
+var float initRiskPts = na
+var bool  trailActive = false
+
+if strategy.position_size > 0
+    if na(activeStop)
+        activeStop  := strategy.position_avg_price - longStopPts
+        initRiskPts := longStopPts
+        trailActive := false
+    profitPts = close - strategy.position_avg_price
+    if not trailActive and profitPts >= trailActivateR * initRiskPts
+        trailActive := true
+    if trailActive
+        buf = profitPts >= trailStage2R * initRiskPts ? trailBufferPts2 : trailBufferPts
+        activeStop := math.max(activeStop, vwapHTF - buf)
+    strategy.exit("Long Exit", from_entry="Long", stop=activeStop)
+
+if strategy.position_size < 0
+    if na(activeStop)
+        activeStop  := strategy.position_avg_price + shortStopPts
+        initRiskPts := shortStopPts
+        trailActive := false
+    profitPts = strategy.position_avg_price - close
+    if not trailActive and profitPts >= trailActivateR * initRiskPts
+        trailActive := true
+    if trailActive
+        buf = profitPts >= trailStage2R * initRiskPts ? trailBufferPts2 : trailBufferPts
+        activeStop := math.min(activeStop, vwapHTF + buf)
+    strategy.exit("Short Exit", from_entry="Short", stop=activeStop)
+
+if isFlat
+    activeStop  := na
+    trailActive := false
+
+plot(strategy.position_size != 0 ? activeStop : na, title="Active Stop",
+     color=color.new(color.purple, 0), style=plot.style_linebr, linewidth=2)
+
+// ============================================================================
+// End-of-day flatten
+// ============================================================================
+if inFlattenWindow and strategy.position_size != 0
+    strategy.close_all(comment="EOD Flatten")

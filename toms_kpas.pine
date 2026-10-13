@@ -1,0 +1,225 @@
+//@version=6
+indicator("Tom's KPAs", overlay=true, precision=2)
+
+// Inputs for colors
+color_daily_50 = input.color(color.new(color.blue, 80), "Daily 50 SMA Color")
+color_daily_200 = input.color(color.new(color.blue, 40), "Daily 200 SMA Color")
+color_4h_50 = input.color(color.new(color.green, 80), "4H 50 SMA Color")
+color_4h_200 = input.color(color.new(color.green, 40), "4H 200 SMA Color")
+color_1h_50 = input.color(color.new(color.red, 80), "1H 50 SMA Color")
+color_1h_200 = input.color(color.new(color.red, 40), "1H 200 SMA Color")
+
+show_1h_smas = input.bool(true, "Show 1H SMAs", tooltip="Turn off to hide the 1-hour 50/200 SMAs if they add too much chop")
+
+// Inputs for line labels
+show_labels = input.bool(true, "Show Labels")
+max_distance = input.float(800.0, "Max Distance from Price", step=50, tooltip="Hide SMA if more than this many points away from current price")
+
+// Inputs for Previous Day High/Low
+show_pdh_pdl = input.bool(true, "Show Previous Day High/Low", group="Prior Day Levels")
+regular_session = input.session("0930-1600", "Regular Session", group="Prior Day Levels", tooltip="Used to define 'previous day' high/low. Interpreted in the Session Timezone set under Overnight Levels below.")
+color_pdh = input.color(color.new(color.orange, 20), "PDH Color", group="Prior Day Levels")
+color_pdl = input.color(color.new(color.orange, 20), "PDL Color", group="Prior Day Levels")
+
+// Inputs for Overnight High/Low
+show_onh_onl = input.bool(true, "Show Overnight High/Low", group="Overnight Levels")
+overnight_session = input.session("1800-0930", "Overnight Session", group="Overnight Levels", tooltip="Only works on intraday chart timeframes. Default is 6:00 PM to 9:30 AM in the timezone set below.")
+session_timezone = input.string("America/New_York", "Session Timezone", options=["America/New_York", "America/Chicago", "UTC", "Europe/London"], group="Overnight Levels", tooltip="Session times above are interpreted in this timezone. CME futures report their own exchange timezone as Chicago, which is 1 hour behind Eastern -- set this explicitly so '0930' means 9:30 AM Eastern (or whichever zone you actually trade by), not the exchange's native zone.")
+color_onh = input.color(color.new(color.purple, 20), "ONH Color", group="Overnight Levels")
+color_onl = input.color(color.new(color.purple, 20), "ONL Color", group="Overnight Levels")
+
+show_debug = input.bool(false, "Show Debug Table", group="Debug", tooltip="Displays the live computed PDH/PDL/ONH/ONL values and session booleans so we can diagnose any remaining issues.")
+
+// Calculate SMAs on different timeframes
+// Daily
+daily_50 = request.security(syminfo.tickerid, "D", ta.sma(close, 50))
+daily_200 = request.security(syminfo.tickerid, "D", ta.sma(close, 200))
+
+// 4-Hour
+four_hour_50 = request.security(syminfo.tickerid, "240", ta.sma(close, 50))
+four_hour_200 = request.security(syminfo.tickerid, "240", ta.sma(close, 200))
+
+// 1-Hour
+one_hour_50 = request.security(syminfo.tickerid, "60", ta.sma(close, 50))
+one_hour_200 = request.security(syminfo.tickerid, "60", ta.sma(close, 200))
+
+// Explicit ticker so overnight calc always has extended-session bars, regardless of the
+// chart's own Extended Hours display toggle. ticker.modify() preserves the chart's price
+// adjustment/back-adjustment settings (unlike ticker.new, which resets them and can produce
+// a different price scale on futures/continuous contracts).
+extended_ticker = ticker.modify(syminfo.tickerid, session = session.extended)
+
+// Previous Day High/Low: accumulate only bars inside regular_session (user-configurable
+// exchange-time window above), and lock in the value the instant that window closes.
+pdh_pdl_calc() =>
+    is_regular = not na(time(timeframe.period, regular_session, session_timezone))
+    var bool was_regular = false
+    var float day_hi = na
+    var float day_lo = na
+    var float ph = na
+    var float pl = na
+    if is_regular
+        day_hi := na(day_hi) ? high : math.max(day_hi, high)
+        day_lo := na(day_lo) ? low : math.min(day_lo, low)
+    else if was_regular
+        ph := day_hi
+        pl := day_lo
+        day_hi := na
+        day_lo := na
+    was_regular := is_regular
+    [ph, pl]
+
+[pdh, pdl] = request.security(extended_ticker, timeframe.period, pdh_pdl_calc(), lookahead=barmerge.lookahead_off)
+
+// Overnight High/Low: updates live while inside the overnight_session window (input above),
+// resetting at the start of each new window. Once the window closes, it holds that session's
+// final high/low until the next overnight window begins and starts accumulating fresh.
+overnight_calc() =>
+    in_sess = not na(time(timeframe.period, overnight_session, session_timezone))
+    var bool was_in_sess = false
+    var float hi = na
+    var float lo = na
+    if in_sess
+        if not was_in_sess
+            hi := high
+            lo := low
+        else
+            hi := math.max(hi, high)
+            lo := math.min(lo, low)
+    was_in_sess := in_sess
+    [hi, lo]
+
+[on_high, on_low] = request.security(extended_ticker, timeframe.period, overnight_calc())
+
+// Main-scope sanity checks (computed directly on the chart's own bars, not inside a
+// security() context) so the debug table can show whether the security-context values
+// agree with a straightforward same-bar calculation.
+is_regular_now = not na(time(timeframe.period, regular_session))
+in_overnight_now = not na(time(timeframe.period, overnight_session))
+
+var table debug_table = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 0), border_width=1)
+if show_debug and barstate.islast
+    table.cell(debug_table, 0, 0, "Debug", text_color=color.white, bgcolor=color.gray)
+    table.cell(debug_table, 1, 0, "", bgcolor=color.gray)
+    table.cell(debug_table, 0, 1, "close", text_color=color.white)
+    table.cell(debug_table, 1, 1, str.tostring(close, "#.####"), text_color=color.white)
+    table.cell(debug_table, 0, 2, "pdh", text_color=color.white)
+    table.cell(debug_table, 1, 2, str.tostring(pdh, "#.####"), text_color=color.white)
+    table.cell(debug_table, 0, 3, "pdl", text_color=color.white)
+    table.cell(debug_table, 1, 3, str.tostring(pdl, "#.####"), text_color=color.white)
+    table.cell(debug_table, 0, 4, "on_high", text_color=color.white)
+    table.cell(debug_table, 1, 4, str.tostring(on_high, "#.####"), text_color=color.white)
+    table.cell(debug_table, 0, 5, "on_low", text_color=color.white)
+    table.cell(debug_table, 1, 5, str.tostring(on_low, "#.####"), text_color=color.white)
+    table.cell(debug_table, 0, 6, "is_regular_now / in_ON_now", text_color=color.white)
+    table.cell(debug_table, 1, 6, str.tostring(is_regular_now) + " / " + str.tostring(in_overnight_now), text_color=color.white)
+
+// Variables to store line and label objects
+var line daily_50_line = line.new(na, na, na, na)
+var line daily_200_line = line.new(na, na, na, na)
+var line four_hour_50_line = line.new(na, na, na, na)
+var line four_hour_200_line = line.new(na, na, na, na)
+var line one_hour_50_line = line.new(na, na, na, na)
+var line one_hour_200_line = line.new(na, na, na, na)
+
+var label daily_50_label = label.new(na, na, "")
+var label daily_200_label = label.new(na, na, "")
+var label four_hour_50_label = label.new(na, na, "")
+var label four_hour_200_label = label.new(na, na, "")
+var label one_hour_50_label = label.new(na, na, "")
+var label one_hour_200_label = label.new(na, na, "")
+
+var line pdh_line = line.new(na, na, na, na)
+var line pdl_line = line.new(na, na, na, na)
+var line onh_line = line.new(na, na, na, na)
+var line onl_line = line.new(na, na, na, na)
+
+var label pdh_label = label.new(na, na, "")
+var label pdl_label = label.new(na, na, "")
+var label onh_label = label.new(na, na, "")
+var label onl_label = label.new(na, na, "")
+
+// Function to check if SMA is within distance and should be shown
+should_show_sma(sma_value) =>
+    if na(sma_value)
+        false
+    else
+        math.abs(close - sma_value) <= max_distance
+
+// Delete old objects and create new ones on each new bar
+if barstate.isnew or barstate.islast
+    // Delete old lines and labels
+    line.delete(daily_50_line)
+    line.delete(daily_200_line)
+    line.delete(four_hour_50_line)
+    line.delete(four_hour_200_line)
+    line.delete(one_hour_50_line)
+    line.delete(one_hour_200_line)
+    
+    label.delete(daily_50_label)
+    label.delete(daily_200_label)
+    label.delete(four_hour_50_label)
+    label.delete(four_hour_200_label)
+    label.delete(one_hour_50_label)
+    label.delete(one_hour_200_label)
+
+    line.delete(pdh_line)
+    line.delete(pdl_line)
+    line.delete(onh_line)
+    line.delete(onl_line)
+
+    label.delete(pdh_label)
+    label.delete(pdl_label)
+    label.delete(onh_label)
+    label.delete(onl_label)
+    
+    // Create new lines and labels if price is available and within distance
+    if not na(daily_50) and math.abs(close - daily_50) <= max_distance
+        daily_50_line := line.new(bar_index, daily_50, bar_index + 5, daily_50, color=color_daily_50, width=1, style=line.style_solid)
+        if show_labels
+            daily_50_label := label.new(bar_index + 5, daily_50, text="D 50", color=color_daily_50, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+    
+    if not na(daily_200) and math.abs(close - daily_200) <= max_distance
+        daily_200_line := line.new(bar_index, daily_200, bar_index + 5, daily_200, color=color_daily_200, width=1, style=line.style_solid)
+        if show_labels
+            daily_200_label := label.new(bar_index + 5, daily_200, text="D 200", color=color_daily_200, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+    
+    if not na(four_hour_50) and math.abs(close - four_hour_50) <= max_distance
+        four_hour_50_line := line.new(bar_index, four_hour_50, bar_index + 5, four_hour_50, color=color_4h_50, width=1, style=line.style_solid)
+        if show_labels
+            four_hour_50_label := label.new(bar_index + 5, four_hour_50, text="4H 50", color=color_4h_50, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+    
+    if not na(four_hour_200) and math.abs(close - four_hour_200) <= max_distance
+        four_hour_200_line := line.new(bar_index, four_hour_200, bar_index + 5, four_hour_200, color=color_4h_200, width=1, style=line.style_solid)
+        if show_labels
+            four_hour_200_label := label.new(bar_index + 5, four_hour_200, text="4H 200", color=color_4h_200, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+    
+    if show_1h_smas and not na(one_hour_50) and math.abs(close - one_hour_50) <= max_distance
+        one_hour_50_line := line.new(bar_index, one_hour_50, bar_index + 5, one_hour_50, color=color_1h_50, width=1, style=line.style_solid)
+        if show_labels
+            one_hour_50_label := label.new(bar_index + 5, one_hour_50, text="1H 50", color=color_1h_50, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+    
+    if show_1h_smas and not na(one_hour_200) and math.abs(close - one_hour_200) <= max_distance
+        one_hour_200_line := line.new(bar_index, one_hour_200, bar_index + 5, one_hour_200, color=color_1h_200, width=1, style=line.style_solid)
+        if show_labels
+            one_hour_200_label := label.new(bar_index + 5, one_hour_200, text="1H 200", color=color_1h_200, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+
+    if show_pdh_pdl and not na(pdh) and math.abs(close - pdh) <= max_distance
+        pdh_line := line.new(bar_index, pdh, bar_index + 5, pdh, color=color_pdh, width=1, style=line.style_dashed)
+        if show_labels
+            pdh_label := label.new(bar_index + 5, pdh, text="PDH", color=color_pdh, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+
+    if show_pdh_pdl and not na(pdl) and math.abs(close - pdl) <= max_distance
+        pdl_line := line.new(bar_index, pdl, bar_index + 5, pdl, color=color_pdl, width=1, style=line.style_dashed)
+        if show_labels
+            pdl_label := label.new(bar_index + 5, pdl, text="PDL", color=color_pdl, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+
+    if show_onh_onl and not na(on_high) and math.abs(close - on_high) <= max_distance
+        onh_line := line.new(bar_index, on_high, bar_index + 5, on_high, color=color_onh, width=1, style=line.style_dashed)
+        if show_labels
+            onh_label := label.new(bar_index + 5, on_high, text="ONH", color=color_onh, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+
+    if show_onh_onl and not na(on_low) and math.abs(close - on_low) <= max_distance
+        onl_line := line.new(bar_index, on_low, bar_index + 5, on_low, color=color_onl, width=1, style=line.style_dashed)
+        if show_labels
+            onl_label := label.new(bar_index + 5, on_low, text="ONL", color=color_onl, textcolor=color.white, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)

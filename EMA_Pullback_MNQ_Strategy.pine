@@ -1,0 +1,224 @@
+//@version=5
+strategy("EMA 4/9/21 Pullback Strategy - MNQ", shorttitle="EMA Pullback Strat", overlay=true,
+     initial_capital=25000, currency=currency.USD,
+     default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_contract, commission_value=0.47,
+     slippage=1, calc_on_every_tick=false)
+
+// ============================================================================
+// Designed to run directly on the 5-minute MNQ chart (matches how you trade
+// it live). Pullback = price crosses below the 9 EMA while the 4/9/21 stack
+// still confirms trend, then closes back above the 9 EMA to trigger entry.
+// Stop is structure-based (swing low/high); a hard $-risk filter skips any
+// setup whose swing stop would blow past your risk target. Once a trade is
+// far enough in profit, the stop trails mechanically off the 9 EMA instead
+// of by feel, so the exit isn't a live emotional decision either.
+// ============================================================================
+
+// ---------- Inputs ----------
+fastLen   = input.int(4,  "Fast EMA Length", minval=1)
+midLen    = input.int(9,  "Mid EMA Length (pullback level)", minval=1)
+trendLen  = input.int(21, "Trend EMA Length", minval=1)
+
+sessionInput = input.session("1000-1200", "Entry Window")
+sessionTZ    = input.string("America/New_York", "Session Timezone")
+flattenWindow = input.session("1555-1600", "Force-Flatten Window (avoid overnight exposure)")
+
+swingLookback  = input.int(5, "Swing Stop Lookback (bars)", minval=1)
+stopBufferPts  = input.float(2.0, "Stop Buffer Beyond Swing (points)", minval=0)
+
+qtyContracts    = input.int(2, "Contracts per Trade", minval=1)
+pointValue      = input.float(2.0, "Dollar Value per Point (MNQ = $2/pt)", minval=0.01)
+maxRiskPerTrade = input.float(150, "Max $ Risk per Trade (skip setup if exceeded)", minval=0)
+
+trailActivateR  = input.float(1.0, "Trail Activation (multiple of initial risk)", minval=0)
+trailBufferPts  = input.float(1.0, "Trail Buffer Beyond 9 EMA (points)", minval=0)
+trailStage2R    = input.float(2.0, "Stage 2 Trail Activation (multiple of initial risk, switches to 21 EMA)", minval=0)
+trailBufferPts2 = input.float(2.0, "Stage 2 Trail Buffer Beyond 21 EMA (points)", minval=0)
+
+maxTradesPerDay = input.int(3, "Max Trades Per Day", minval=1)
+maxLossesPerDay = input.int(2, "Max Losses Per Day", minval=1)
+cooldownBars    = input.int(6, "Bars to Wait After a Loss Before Re-Entering", minval=0)
+
+// ---------- EMAs / trend ----------
+ema4  = ta.ema(close, fastLen)
+ema9  = ta.ema(close, midLen)
+ema21 = ta.ema(close, trendLen)
+
+uptrend   = ema4 > ema9 and ema9 > ema21
+downtrend = ema4 < ema9 and ema9 < ema21
+
+plot(ema4,  "Fast EMA",  color=color.new(color.green, 20))
+plot(ema9,  "Mid EMA",   color=color.new(color.red, 20))
+plot(ema21, "Trend EMA", color=color.new(color.orange, 20), linewidth=2)
+
+// ---------- Session / guardrails ----------
+inWindow        = not na(time(timeframe.period, sessionInput, sessionTZ))
+inFlattenWindow = not na(time(timeframe.period, flattenWindow, sessionTZ))
+
+newDay = ta.change(time("D")) != 0
+
+var int tradesToday      = 0
+var int lossesToday      = 0
+var int prevClosedTrades = 0
+var int lastLossExitBar  = na
+
+if newDay
+    tradesToday := 0
+    lossesToday := 0
+
+if strategy.closedtrades > prevClosedTrades
+    for i = prevClosedTrades to strategy.closedtrades - 1
+        if strategy.closedtrades.profit(i) < 0
+            lossesToday := lossesToday + 1
+            lastLossExitBar := strategy.closedtrades.exit_bar_index(i)
+    prevClosedTrades := strategy.closedtrades
+
+cooldownActive = not na(lastLossExitBar) and (bar_index - lastLossExitBar) < cooldownBars
+guardrailsOk = tradesToday < maxTradesPerDay and lossesToday < maxLossesPerDay and not cooldownActive
+isFlat = strategy.position_size == 0
+
+// ---------- Pullback / reclaim trigger ----------
+longReclaim  = ta.crossover(close, ema9)
+shortReclaim = ta.crossunder(close, ema9)
+
+longSetup  = uptrend   and close > ema21 and inWindow and isFlat and guardrailsOk
+shortSetup = downtrend and close < ema21 and inWindow and isFlat and guardrailsOk
+
+longTrigger  = longSetup  and longReclaim
+shortTrigger = shortSetup and shortReclaim
+
+// ---------- Structure-based stop + $ risk filter ----------
+swingLow  = ta.lowest(low, swingLookback)
+swingHigh = ta.highest(high, swingLookback)
+
+longStopPrice  = swingLow  - stopBufferPts
+shortStopPrice = swingHigh + stopBufferPts
+
+longRiskPts  = close - longStopPrice
+shortRiskPts = shortStopPrice - close
+
+longRiskOk  = longRiskPts  > 0 and longRiskPts  * pointValue * qtyContracts <= maxRiskPerTrade
+shortRiskOk = shortRiskPts > 0 and shortRiskPts * pointValue * qtyContracts <= maxRiskPerTrade
+
+// Informational marker: valid setup that got skipped for being too wide to size
+plotshape(longTrigger and not longRiskOk, title="Long Skipped (Risk)", style=shape.xcross,
+     location=location.belowbar, color=color.gray, size=size.tiny)
+plotshape(shortTrigger and not shortRiskOk, title="Short Skipped (Risk)", style=shape.xcross,
+     location=location.abovebar, color=color.gray, size=size.tiny)
+
+// ---------- Position/trail state ----------
+var float activeStop   = na
+var float initRiskPts  = na
+var bool  trailActive  = false
+var bool  stage2Active = false
+
+// ---------- Entries ----------
+if longTrigger and longRiskOk
+    strategy.entry("Long", strategy.long, qty=qtyContracts)
+    activeStop   := longStopPrice
+    initRiskPts  := longRiskPts
+    trailActive  := false
+    stage2Active := false
+    tradesToday  := tradesToday + 1
+
+    alert('{"ticker":"' + syminfo.ticker + '","action":"buy","sentiment":"long","quantity":"' +
+         str.tostring(qtyContracts) + '","stop":"' + str.tostring(longStopPrice) +
+         '","comment":"EMA9 pullback long"}', alert.freq_once_per_bar_close)
+
+if shortTrigger and shortRiskOk
+    strategy.entry("Short", strategy.short, qty=qtyContracts)
+    activeStop   := shortStopPrice
+    initRiskPts  := shortRiskPts
+    trailActive  := false
+    stage2Active := false
+    tradesToday  := tradesToday + 1
+
+    alert('{"ticker":"' + syminfo.ticker + '","action":"sell","sentiment":"short","quantity":"' +
+         str.tostring(qtyContracts) + '","stop":"' + str.tostring(shortStopPrice) +
+         '","comment":"EMA9 pullback short"}', alert.freq_once_per_bar_close)
+
+// ---------- Mechanical trail + exit ----------
+if strategy.position_size > 0
+    profitPts = close - strategy.position_avg_price
+    if not trailActive and profitPts >= trailActivateR * initRiskPts
+        trailActive := true
+    if trailActive
+        stage2Active := profitPts >= trailStage2R * initRiskPts
+        candidate = stage2Active ? ema21 - trailBufferPts2 : ema9 - trailBufferPts
+        activeStop := math.max(activeStop, candidate)
+    strategy.exit("Long Exit", from_entry="Long", stop=activeStop)
+
+if strategy.position_size < 0
+    profitPts = strategy.position_avg_price - close
+    if not trailActive and profitPts >= trailActivateR * initRiskPts
+        trailActive := true
+    if trailActive
+        stage2Active := profitPts >= trailStage2R * initRiskPts
+        candidate = stage2Active ? ema21 + trailBufferPts2 : ema9 + trailBufferPts
+        activeStop := math.min(activeStop, candidate)
+    strategy.exit("Short Exit", from_entry="Short", stop=activeStop)
+
+stopMoved = strategy.position_size != 0 and trailActive and activeStop != activeStop[1]
+if stopMoved
+    side = strategy.position_size > 0 ? "long" : "short"
+    alert('{"ticker":"' + syminfo.ticker + '","action":"update_stop","sentiment":"' + side +
+         '","stop":"' + str.tostring(activeStop) + '"}', alert.freq_once_per_bar_close)
+
+plot(strategy.position_size != 0 ? activeStop : na, title="Active Stop",
+     color=color.new(color.purple, 0), style=plot.style_linebr, linewidth=2)
+
+// ---------- End-of-day flatten ----------
+if inFlattenWindow and not isFlat
+    strategy.close_all(comment="EOD Flatten")
+
+// ---------- Status panel ----------
+showPanel = input.bool(true, "Show Status Panel")
+
+if showPanel and barstate.islast
+    var table dash = table.new(position.top_right, 2, 8, border_width=1)
+
+    trendLabel = uptrend ? "UP" : downtrend ? "DOWN" : "NONE"
+    trendColor = uptrend ? color.new(color.green, 70) : downtrend ? color.new(color.red, 70) : color.new(color.gray, 70)
+
+    posLabel = strategy.position_size > 0 ? "LONG " + str.tostring(strategy.position_size) :
+         strategy.position_size < 0 ? "SHORT " + str.tostring(math.abs(strategy.position_size)) : "FLAT"
+
+    liveRiskDollars = uptrend and isFlat ? longRiskPts * pointValue * qtyContracts :
+         downtrend and isFlat ? shortRiskPts * pointValue * qtyContracts : na
+    liveRiskLabel = na(liveRiskDollars) ? "—" : "$" + str.tostring(liveRiskDollars, "#.##")
+    liveRiskColor = na(liveRiskDollars) ? color.new(color.gray, 70) :
+         liveRiskDollars <= maxRiskPerTrade ? color.new(color.green, 70) : color.new(color.red, 70)
+
+    guardrailColor = guardrailsOk ? color.new(color.green, 70) : color.new(color.red, 70)
+    windowColor = inWindow ? color.new(color.green, 70) : color.new(color.gray, 70)
+
+    table.cell(dash, 0, 0, "Trend", text_color=color.white, bgcolor=color.new(color.navy, 40))
+    table.cell(dash, 1, 0, trendLabel, text_color=color.white, bgcolor=trendColor)
+
+    table.cell(dash, 0, 1, "Entry Window", text_color=color.white, bgcolor=color.new(color.navy, 40))
+    table.cell(dash, 1, 1, inWindow ? "OPEN" : "CLOSED", text_color=color.white, bgcolor=windowColor)
+
+    table.cell(dash, 0, 2, "Position", text_color=color.white, bgcolor=color.new(color.navy, 40))
+    table.cell(dash, 1, 2, posLabel, text_color=color.white, bgcolor=color.new(color.gray, 70))
+
+    trailStageLabel = not trailActive ? "" : stage2Active ? " (trail: 21ema)" : " (trail: 9ema)"
+
+    table.cell(dash, 0, 3, "Active Stop", text_color=color.white, bgcolor=color.new(color.navy, 40))
+    table.cell(dash, 1, 3, na(activeStop) or isFlat ? "—" : str.tostring(activeStop, "#.##") + trailStageLabel, text_color=color.white, bgcolor=color.new(color.gray, 70))
+
+    table.cell(dash, 0, 4, "Next Trade Risk", text_color=color.white, bgcolor=color.new(color.navy, 40))
+    table.cell(dash, 1, 4, liveRiskLabel, text_color=color.white, bgcolor=liveRiskColor)
+
+    table.cell(dash, 0, 5, "Trades Today", text_color=color.white, bgcolor=color.new(color.navy, 40))
+    table.cell(dash, 1, 5, str.tostring(tradesToday) + " / " + str.tostring(maxTradesPerDay), text_color=color.white, bgcolor=guardrailColor)
+
+    table.cell(dash, 0, 6, "Losses Today", text_color=color.white, bgcolor=color.new(color.navy, 40))
+    table.cell(dash, 1, 6, str.tostring(lossesToday) + " / " + str.tostring(maxLossesPerDay), text_color=color.white, bgcolor=guardrailColor)
+
+    cooldownBarsLeft = cooldownActive ? cooldownBars - (bar_index - lastLossExitBar) : 0
+    cooldownLabel = cooldownActive ? str.tostring(cooldownBarsLeft) + " bars left" : "OK"
+    cooldownColor = cooldownActive ? color.new(color.red, 70) : color.new(color.green, 70)
+
+    table.cell(dash, 0, 7, "Cooldown", text_color=color.white, bgcolor=color.new(color.navy, 40))
+    table.cell(dash, 1, 7, cooldownLabel, text_color=color.white, bgcolor=cooldownColor)

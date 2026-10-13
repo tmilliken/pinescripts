@@ -1,0 +1,90 @@
+//@version=6
+indicator("EMA Band Crossover", overlay=true, precision=4)
+
+// ---------- Inputs ----------
+ema1Length = input.int(4,  title="Fast EMA Length", minval=1)
+ema2Length = input.int(9,  title="Slow EMA Length", minval=1)
+ema3Length = input.int(21, title="Trend EMA Length", minval=1)
+srcTF      = input.timeframe("5", title="EMA Timeframe")
+
+showSignals = input.bool(true, title="Show Crossover Markers")
+
+colorAbove   = input.color(color.new(color.green, 80),  title="4 Above 9 (Green)")
+colorBelow   = input.color(color.new(color.red, 80),    title="4 Below 9 (Red)")
+colorBetween = input.color(color.new(color.yellow, 80), title="Candle Between (Yellow)")
+colorTrendUp   = input.color(color.new(color.green, 92), title="21 EMA Shading - Fast Above Slow")
+colorTrendDown = input.color(color.new(color.red, 92),   title="21 EMA Shading - Fast Below Slow")
+
+// Line colors default to 20% opacity (transparency 80)
+colorEma1    = input.color(color.new(color.green, 80),  title="Fast EMA Line")
+colorEma2    = input.color(color.new(color.red, 80),    title="Slow EMA Line")
+colorEma3    = input.color(color.new(color.orange, 80), title="21 EMA Line")
+
+// Guard: the chart timeframe must not be higher than the EMA timeframe
+if timeframe.in_seconds() > timeframe.in_seconds(srcTF)
+    runtime.error("Chart timeframe must be less than or equal to the EMA Timeframe input.")
+
+// ---------- Non-repainting higher-timeframe EMAs ----------
+// [1] offset + lookahead_on = last CONFIRMED srcTF bar, updated at the open
+// of each new srcTF candle. Values do not repaint.
+ema1   = request.security(syminfo.tickerid, srcTF, ta.ema(close, ema1Length)[1], lookahead=barmerge.lookahead_on)
+ema2   = request.security(syminfo.tickerid, srcTF, ta.ema(close, ema2Length)[1], lookahead=barmerge.lookahead_on)
+ema3   = request.security(syminfo.tickerid, srcTF, ta.ema(close, ema3Length)[1], lookahead=barmerge.lookahead_on)
+close5 = request.security(syminfo.tickerid, srcTF, close[1],                    lookahead=barmerge.lookahead_on)
+
+// ---------- Band / fill state ----------
+candleBetween = (close5 > math.min(ema1, ema2)) and (close5 < math.max(ema1, ema2))
+emaAbove = ema1 > ema2
+emaBelow = ema1 < ema2
+
+var int fillState = 0  // 1 = above, -1 = below, 0 = between
+if emaAbove
+    fillState := 1
+else if emaBelow
+    fillState := -1
+if candleBetween
+    fillState := 0
+
+fillColor = switch fillState
+    1  => colorAbove
+    -1 => colorBelow
+    => colorBetween
+
+// ---------- 21 EMA shading state ----------
+// Based only on fast vs slow (ignores the yellow 'between' state).
+// If the EMAs are exactly equal, the previous color is kept.
+var int trendState = 0
+if emaAbove
+    trendState := 1
+else if emaBelow
+    trendState := -1
+
+trendFillColor = trendState == 1 ? colorTrendUp : trendState == -1 ? colorTrendDown : na
+
+// Nearest edge of the 4/9 band to the 21 EMA. If the 21 EMA is inside
+// the band, the edge equals the 21 EMA, so there is no shading.
+bandTop  = math.max(ema1, ema2)
+bandBot  = math.min(ema1, ema2)
+bandEdge = ema3 > bandTop ? bandTop : ema3 < bandBot ? bandBot : ema3
+
+// ---------- Plots ----------
+p1 = plot(ema1, title="Fast EMA", color=colorEma1, linewidth=1)
+p2 = plot(ema2, title="Slow EMA", color=colorEma2, linewidth=1)
+p3 = plot(ema3, title="21 EMA", color=colorEma3, linewidth=2)
+pEdge = plot(bandEdge, title="Band Edge (hidden)", color=na, editable=false)
+
+fill(p1, p2, color=fillColor, title="EMA Band Fill")
+fill(p3, pEdge, color=trendFillColor, title="21 EMA Shading")
+
+// ---------- Crossover signals ----------
+bullCross = ta.crossover(ema1, ema2)
+bearCross = ta.crossunder(ema1, ema2)
+
+plotshape(showSignals and bullCross, title="Bullish Cross", style=shape.triangleup,
+     location=location.belowbar, color=color.green, size=size.tiny)
+plotshape(showSignals and bearCross, title="Bearish Cross", style=shape.triangledown,
+     location=location.abovebar, color=color.red, size=size.tiny)
+
+// ---------- Alerts ----------
+alertcondition(bullCross, title="Bullish EMA Cross", message="Fast EMA crossed above Slow EMA")
+alertcondition(bearCross, title="Bearish EMA Cross", message="Fast EMA crossed below Slow EMA")

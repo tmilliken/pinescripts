@@ -1,0 +1,66 @@
+//@version=5
+indicator("DriftPullback VWAP", shorttitle="DP-VWAP", overlay=true)
+
+// ============================================================================
+// Inputs
+// ============================================================================
+vwapTF        = input.timeframe("15", "VWAP Calculation Timeframe")
+sessionInput  = input.session("0930-1600", "RTH Anchor Session (reset + active window)")
+sessionTZ     = input.string("America/New_York", "Session Timezone")
+srcInput      = input.source(hlc3, "VWAP Source")
+
+showLine      = input.bool(true, "Show VWAP Line")
+lineColor     = input.color(color.new(color.blue, 0), "VWAP Line Color")
+lineWidth     = input.int(2, "VWAP Line Width", minval=1)
+
+showMarkers   = input.bool(true, "Show 15min Calc Markers")
+upColor       = input.color(color.new(color.lime, 0), "Marker Color (price above VWAP)")
+downColor     = input.color(color.new(color.red, 0), "Marker Color (price below VWAP)")
+
+// ============================================================================
+// Session-anchored VWAP, calculated inside the request.security() context so
+// it runs natively on the 15min series (not re-derived from 5min bars).
+// Resets fresh at session start (9:30 ET) and goes flat/na outside the
+// session, ignoring the overnight Globex session entirely.
+// ============================================================================
+calcVWAP() =>
+    sess = not na(time(timeframe.period, sessionInput, sessionTZ))
+    newSession = sess and not sess[1]
+
+    var float cumPV  = na
+    var float cumVol = na
+
+    if newSession
+        cumPV  := 0.0
+        cumVol := 0.0
+    else if not sess
+        cumPV  := na
+        cumVol := na
+
+    if sess
+        cumPV  := cumPV + srcInput * volume
+        cumVol := cumVol + volume
+
+    vwapVal = sess ? cumPV / cumVol : na
+    [vwapVal, sess, time]
+
+[vwapHTF, sessHTF, htfBarTime] = request.security(syminfo.tickerid, vwapTF, calcVWAP(), gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+// ============================================================================
+// Plot
+// ============================================================================
+plotLine = showLine ? (sessHTF ? vwapHTF : na) : na
+plot(plotLine, title="DriftPullback VWAP", color=lineColor, linewidth=lineWidth, style=plot.style_stepline)
+
+// New 15min bar detected via its (fixed-at-open) start time, not its VWAP
+// value - the cumulative VWAP keeps changing intrabar while a 15min bar is
+// still forming, which would otherwise fire the marker on every lower-
+// timeframe candle inside the still-open bar instead of once per 15min.
+// barstate.isconfirmed additionally blocks the still-live/unconfirmed bar,
+// since request.security's view of the current (not yet closed) HTF bar can
+// itself still revise intrabar, which would otherwise re-trigger the marker
+// on every realtime update of the lower-timeframe chart.
+isNewCalc = sessHTF and htfBarTime != htfBarTime[1] and barstate.isconfirmed
+markerColor = close >= vwapHTF ? upColor : downColor
+
+plotchar(showMarkers and isNewCalc ? vwapHTF : na, title="15min Calc Marker", char="+", location=location.absolute, color=markerColor, size=size.tiny)

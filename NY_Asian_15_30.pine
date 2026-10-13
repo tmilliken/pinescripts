@@ -1,0 +1,196 @@
+//@version=6
+indicator("Session Opening Ranges (Pre-Market, NY, Asian)", shorttitle = "Session ORBs", overlay = true, max_lines_count = 500, max_boxes_count = 500)
+
+// ─────────────────────────────────────────────
+// All ranges are measured from 1-minute data via request.security_lower_tf(),
+// NOT from the chart's bars, so the levels are identical on every timeframe.
+// ─────────────────────────────────────────────
+
+// ── General ──────────────────────────────────
+ny_timezone    = "America/New_York"
+asian_timezone = input.string("Etc/UTC", "Asian Session Timezone", group = "General")
+calc_tf        = input.timeframe("1", "Range Calculation Timeframe", group = "General", tooltip = "Resolution used to measure the ranges. Leave at 1 minute unless the symbol has no 1-minute history.")
+line_width     = input.int(2, "Line Width", minval = 1, maxval = 5, group = "General")
+
+// ── Pre-market ───────────────────────────────
+GP = "Pre-Market Range (New York time)"
+pm_on       = input.bool(true, "Show Pre-Market Range", group = GP)
+pm_hour     = input.int(8,   "Open Hour",   minval = 0, maxval = 23, group = GP)
+pm_min      = input.int(0,   "Open Minute", minval = 0, maxval = 59, group = GP)
+pm_len      = input.int(15,  "Range Length (minutes)", minval = 1, group = GP)
+pm_draw_len = input.int(150, "Draw Levels For (minutes after open)", minval = 1, group = GP)
+pm_hi_col   = input.color(color.new(color.teal, 40),    "High", group = GP, inline = "pmc")
+pm_lo_col   = input.color(color.new(color.fuchsia, 40), "Low",  group = GP, inline = "pmc")
+pm_box_col  = input.color(color.new(color.gray, 88),    "Box",  group = GP, inline = "pmc")
+
+// ── New York ─────────────────────────────────
+GN = "New York Session"
+ny_hour     = input.int(9,   "Open Hour",   minval = 0, maxval = 23, group = GN)
+ny_min      = input.int(30,  "Open Minute", minval = 0, maxval = 59, group = GN)
+ny_draw_len = input.int(150, "Draw Levels For (minutes after open)", minval = 1, group = GN)
+
+r1_on      = input.bool(true, "Show Range 1", group = GN)
+r1_len     = input.int(15, "Range 1 Length (minutes)", minval = 1, group = GN)
+r1_hi_col  = input.color(color.new(color.green, 50), "High", group = GN, inline = "r1c")
+r1_lo_col  = input.color(color.new(color.red, 50),   "Low",  group = GN, inline = "r1c")
+r1_box_col = input.color(color.new(color.blue, 90),  "Box",  group = GN, inline = "r1c")
+
+r2_on      = input.bool(true, "Show Range 2", group = GN)
+r2_len     = input.int(30, "Range 2 Length (minutes)", minval = 1, group = GN)
+r2_live    = input.bool(false, "Draw Range 2 while still forming", group = GN)
+r2_hi_col  = input.color(color.new(color.green, 20), "High", group = GN, inline = "r2c")
+r2_lo_col  = input.color(color.new(color.red, 20),   "Low",  group = GN, inline = "r2c")
+r2_box_col = input.color(color.new(color.blue, 80),  "Box",  group = GN, inline = "r2c")
+
+// ── Asian ────────────────────────────────────
+GA = "Asian Session"
+as_on       = input.bool(true, "Show Asian Range", group = GA)
+as_hour     = input.int(0,  "Open Hour",   minval = 0, maxval = 23, group = GA)
+as_min      = input.int(0,  "Open Minute", minval = 0, maxval = 59, group = GA)
+as_len      = input.int(5,  "Range Length (minutes)", minval = 1, group = GA)
+as_draw_len = input.int(60, "Draw Levels For (minutes after open)", minval = 1, group = GA)
+as_hi_col   = input.color(color.new(color.orange, 50), "High", group = GA, inline = "asc")
+as_lo_col   = input.color(color.new(color.purple, 50), "Low",  group = GA, inline = "asc")
+as_box_col  = input.color(color.new(color.yellow, 85), "Box",  group = GA, inline = "asc")
+
+// ── Helpers ──────────────────────────────────
+f_mins(t, tz) => hour(t, tz) * 60 + minute(t, tz)
+f_day(t, tz)  => year(t, tz) * 10000 + month(t, tz) * 100 + dayofmonth(t, tz)
+
+// Minutes elapsed since the most recent occurrence of the session open.
+// Wrapping with %1440 means sessions that straddle midnight work too.
+f_rel(t, tz, startMin) => (f_mins(t, tz) - startMin + 1440) % 1440
+
+// ── Range object ─────────────────────────────
+type ORB
+    string tz
+    int    start_min
+    int    len
+    int    draw_len
+    bool   draw_live
+    bool   enabled
+    color  hi_col
+    color  lo_col
+    color  box_col
+    int    day
+    int    chart_day
+    float  hi
+    float  lo
+    bool   done = false
+    int    start_bar
+    line   hl
+    line   ll
+    box    bx
+
+method clear_drawings(ORB r) =>
+    if not na(r.hl)
+        line.delete(r.hl)
+    if not na(r.ll)
+        line.delete(r.ll)
+    if not na(r.bx)
+        box.delete(r.bx)
+    r.hl := na
+    r.ll := na
+    r.bx := na
+    r
+
+// Feed one sub-bar (normally a 1-minute bar) into the range.
+method feed(ORB r, int bt, float bh, float bl) =>
+    if r.enabled
+        int rel  = f_rel(bt, r.tz, r.start_min)
+        int sday = f_day(bt - rel * 60000, r.tz)
+        if rel < r.len
+            if na(r.day) or sday != r.day
+                r.day       := sday
+                r.chart_day := f_day(time, r.tz)
+                r.hi        := bh
+                r.lo        := bl
+                r.done      := false
+                r.start_bar := bar_index
+                r.clear_drawings()
+            r.hi := math.max(r.hi, bh)
+            r.lo := math.min(r.lo, bl)
+        else if sday == r.day
+            r.done := true
+    r
+
+method render(ORB r, int lw) =>
+    if r.enabled and not na(r.day) and not na(r.hi) and (r.done or r.draw_live)
+        int  rel_c  = f_rel(time, r.tz, r.start_min)
+        bool active = timeframe.isintraday ? (rel_c < r.draw_len and f_day(time - rel_c * 60000, r.tz) == r.day) : f_day(time, r.tz) == r.chart_day
+        if active
+            if na(r.hl)
+                r.hl := line.new(r.start_bar, r.hi, bar_index, r.hi, xloc = xloc.bar_index, color = r.hi_col, width = lw)
+                r.ll := line.new(r.start_bar, r.lo, bar_index, r.lo, xloc = xloc.bar_index, color = r.lo_col, width = lw)
+                r.bx := box.new(r.start_bar, r.hi, bar_index, r.lo, xloc = xloc.bar_index, bgcolor = r.box_col, border_color = color.new(r.box_col, 100))
+            else
+                line.set_xy1(r.hl, r.start_bar, r.hi)
+                line.set_xy2(r.hl, bar_index, r.hi)
+                line.set_xy1(r.ll, r.start_bar, r.lo)
+                line.set_xy2(r.ll, bar_index, r.lo)
+                box.set_lefttop(r.bx, r.start_bar, r.hi)
+                box.set_rightbottom(r.bx, bar_index, r.lo)
+    r
+
+// ── Ranges ───────────────────────────────────
+var ORB pm   = ORB.new(tz = ny_timezone,    start_min = pm_hour * 60 + pm_min, len = pm_len, draw_len = pm_draw_len, draw_live = true,    enabled = pm_on, hi_col = pm_hi_col, lo_col = pm_lo_col, box_col = pm_box_col)
+var ORB r1   = ORB.new(tz = ny_timezone,    start_min = ny_hour * 60 + ny_min, len = r1_len, draw_len = ny_draw_len, draw_live = true,    enabled = r1_on, hi_col = r1_hi_col, lo_col = r1_lo_col, box_col = r1_box_col)
+var ORB r2   = ORB.new(tz = ny_timezone,    start_min = ny_hour * 60 + ny_min, len = r2_len, draw_len = ny_draw_len, draw_live = r2_live, enabled = r2_on, hi_col = r2_hi_col, lo_col = r2_lo_col, box_col = r2_box_col)
+var ORB asia = ORB.new(tz = asian_timezone, start_min = as_hour * 60 + as_min, len = as_len, draw_len = as_draw_len, draw_live = true,    enabled = as_on, hi_col = as_hi_col, lo_col = as_lo_col, box_col = as_box_col)
+
+var array<ORB> ranges = array.from(pm, r1, r2, asia)
+
+// ── Data ─────────────────────────────────────
+[sub_time, sub_high, sub_low] = request.security_lower_tf(syminfo.tickerid, calc_tf, [time, high, low], ignore_invalid_timeframe = true)
+
+// If the chart is already as fine as (or finer than) the calculation
+// timeframe, the chart bars themselves are accurate and are used directly.
+// Otherwise 1-minute intrabars are used. If the intrabar history has run
+// out, NOTHING is fed, so no inaccurate levels are drawn on old history.
+bool chart_is_fine = timeframe.in_seconds() <= timeframe.in_seconds(calc_tf)
+int  sub_n         = array.size(sub_time)
+
+if chart_is_fine
+    for r in ranges
+        r.feed(time, high, low)
+else if sub_n > 0
+    for i = 0 to sub_n - 1
+        int   bt = array.get(sub_time, i)
+        float bh = array.get(sub_high, i)
+        float bl = array.get(sub_low,  i)
+        for r in ranges
+            r.feed(bt, bh, bl)
+
+for r in ranges
+    r.render(line_width)
+
+// ── Data window values ───────────────────────
+plot(pm.hi,   "Pre-Market High", color = pm_hi_col, display = display.data_window)
+plot(pm.lo,   "Pre-Market Low",  color = pm_lo_col, display = display.data_window)
+plot(r1.hi,   "NY R1 High",      color = r1_hi_col, display = display.data_window)
+plot(r1.lo,   "NY R1 Low",       color = r1_lo_col, display = display.data_window)
+plot(r2.hi,   "NY R2 High",      color = r2_hi_col, display = display.data_window)
+plot(r2.lo,   "NY R2 Low",       color = r2_lo_col, display = display.data_window)
+plot(asia.hi, "Asian High",      color = as_hi_col, display = display.data_window)
+plot(asia.lo, "Asian Low",       color = as_lo_col, display = display.data_window)
+
+// ── Alerts ───────────────────────────────────
+// History ([1]) doesn't work on fields of a persistent object, so copy
+// the fields into plain series first.
+int  pm_day   = pm.day
+int  ny_day   = r1.day
+int  as_day   = asia.day
+bool pm_done  = pm.done
+bool r1_done  = r1.done
+bool r2_done  = r2.done
+bool as_done  = asia.done
+
+alertcondition(not na(pm_day) and pm_day != nz(pm_day[1]), title = "Pre-Market Open",          message = "Pre-market range tracking started")
+alertcondition(pm_done and not pm_done[1],                   title = "Pre-Market Range Complete", message = "Pre-market opening range complete")
+
+alertcondition(not na(ny_day) and ny_day != nz(ny_day[1]),   title = "NY Market Open",           message = "NY market has opened - Range tracking started")
+alertcondition(r1_done and not r1_done[1],                   title = "NY Range 1 Complete",      message = "NY opening range 1 complete")
+alertcondition(r2_done and not r2_done[1],                   title = "NY Range 2 Complete",      message = "NY opening range 2 complete")
+
+alertcondition(not na(as_day) and as_day != nz(as_day[1]),   title = "Asian Market Open",        message = "Asian market has opened - Range tracking started")
+alertcondition(as_done and not as_done[1],                   title = "Asian Range Complete",     message = "Asian opening range complete")
